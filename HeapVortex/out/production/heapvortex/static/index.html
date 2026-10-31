@@ -1,0 +1,95 @@
+<!doctype html><html><head><meta charset="utf-8"><title>HeapVortex</title>
+<style>
+body{margin:0;background:#0b0f1a;color:#dfe6f3;font:14px system-ui,sans-serif;overflow:hidden}
+#hud{position:fixed;top:0;left:0;width:310px;max-height:100vh;overflow:auto;padding:14px;background:#0b0f1acc;box-sizing:border-box}
+h3,h4{margin:6px 0}.bar{height:8px;background:#1b2438;border-radius:4px;margin:6px 0}
+#fill{height:100%;background:#3da9fc;border-radius:4px;width:0}
+.leak{color:#ff6b6b;margin:4px 0;word-break:break-all}.small{color:#8b97b1;font-size:12px}
+#tip{position:fixed;pointer-events:none;background:#000d;padding:5px 9px;border-radius:4px;display:none;font-size:12px}
+</style></head><body>
+<div id="hud"><h3>HeapVortex</h3><div id="heap"></div><div class="bar"><div id="fill"></div></div>
+<div class="small">Each bar = a class (height = retained bytes, log scale). Red = leak suspect. Drag to rotate, scroll to zoom.</div>
+<button id="pause">Pause</button> <button id="rep">Download report</button> <span class="small">red = leak · height = bytes (log)</span><h4 id="selname">Click a bar for its history</h4><canvas id="chart" width="280" height="90"></canvas><h4>Leak suspects</h4><div id="leaks" class="small">Collecting samples...</div></div>
+<div id="tip"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+const scene=new THREE.Scene(),cam=new THREE.PerspectiveCamera(55,innerWidth/innerHeight,.1,500);
+cam.position.set(0,16,36);cam.lookAt(0,4,0);
+const rd=new THREE.WebGLRenderer({antialias:true});rd.setSize(innerWidth,innerHeight);document.body.appendChild(rd.domElement);
+scene.add(new THREE.AmbientLight(0xffffff,.6));
+const dl=new THREE.DirectionalLight(0xffffff,.8);dl.position.set(10,20,10);scene.add(dl);
+const grp=new THREE.Group();scene.add(grp);grp.add(new THREE.GridHelper(70,35,0x223355,0x182238));
+const COL={CRITICAL:"#ff4d4d",HIGH:"#ff9f43",MEDIUM:"#feca57",LOW:"#8b97b1"},lvl=s=>s>=70?"CRITICAL":s>=40?"HIGH":s>=20?"MEDIUM":"LOW";
+const meshes={},MB=b=>(b/1048576).toFixed(1)+" MB";
+let drag=false,px=0,py=0,px0=0,py0=0,paused=false,sel=null;
+let last=null;function update(d){last=d;
+  const names=new Set(d.classes.map(c=>c.name));
+  for(const k in meshes) if(!names.has(k)){grp.remove(meshes[k]);delete meshes[k];}
+  d.classes.forEach((c,i)=>{
+    let m=meshes[c.name];
+    if(!m){m=new THREE.Mesh(new THREE.BoxGeometry(1,1,1),new THREE.MeshStandardMaterial());grp.add(m);meshes[c.name]=m;}
+    m.userData=c;const a=i*.6,r=3+i*.55,h=Math.max(.2,Math.log10(c.bytes+1)*1.6-2);
+    m.position.set(Math.cos(a)*r,h/2,Math.sin(a)*r);const w=c.name===sel?1.7:1;m.scale.set(w,h,w);
+    m.material.color.setHSL(c.leak?0:.55+i*.003,.8,c.leak?.55:.5);
+    m.material.emissive.setHSL(0,c.leak?.9:0,c.leak?.25:0);
+  });
+  document.getElementById("heap").textContent="Heap: "+MB(d.heapUsed)+" / "+MB(d.heapMax);
+  document.getElementById("fill").style.width=(100*d.heapUsed/d.heapMax)+"%";
+  const leaks=d.classes.filter(c=>c.leak).sort((a,b)=>b.severity-a.severity);
+  document.getElementById("leaks").innerHTML=leaks.length?leaks.map(c=>
+    `<div class="leak" style="color:${COL[lvl(c.severity)]}"><b>${lvl(c.severity)} ${c.severity}</b> ${c.name}<br><span class="small">+${(c.slope/1024).toFixed(0)} KB/sample · ${c.instances} objects · ${c.streak} rising samples</span></div>`).join(""):"None detected yet";
+}
+async function poll(){
+  const el=document.getElementById("heap");
+  if(paused)return;
+  try{
+    const d=await (await fetch("/api/snapshot")).json();
+    if(!d.classes.length){el.textContent="Connected, but no samples yet. Check the Java console for 'Sampling failed'.";return;}
+    update(d);if(sel)loadHist();
+  }catch(e){el.textContent="Cannot reach /api/snapshot. Open http://localhost:8080 while the Java app is running.";}
+}
+poll();setInterval(poll,2000);
+addEventListener("mousedown",e=>{drag=true;px=px0=e.clientX;py=py0=e.clientY});
+addEventListener("mouseup",e=>{drag=false;
+  if(Math.hypot(e.clientX-px0,e.clientY-py0)<4&&!e.target.closest("#hud")){
+    mouse.set(e.clientX/innerWidth*2-1,-(e.clientY/innerHeight)*2+1);ray.setFromCamera(mouse,cam);
+    const hit=ray.intersectObjects(Object.values(meshes))[0];sel=hit?hit.object.userData.name:null;loadHist();}
+});
+document.getElementById("rep").onclick=()=>report();
+document.getElementById("pause").onclick=e=>{paused=!paused;e.target.textContent=paused?"Resume":"Pause";};
+function draw(p){const x=document.getElementById("chart").getContext("2d");x.clearRect(0,0,280,90);
+  if(p.length<2)return;const v=p.map(a=>a[1]),mn=Math.min(...v),mx=Math.max(...v);
+  x.strokeStyle="#3da9fc";x.beginPath();p.forEach((a,i)=>{const X=i/(p.length-1)*278+1,Y=88-(a[1]-mn)/(mx-mn||1)*84;i?x.lineTo(X,Y):x.moveTo(X,Y);});x.stroke();}
+const esc=s=>s.replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c]));
+const fmtEta=s=>s<=0?"n/a":s<60?"<1 min":s<3600?Math.round(s/60)+" min":(s/3600).toFixed(1)+" h";
+const fix=n=>(/Session|Cache/i.test(n)?"Check object lifecycle: remove on logout/expiry or use a bounded cache with eviction. ":/HashMap|ArrayList|Set|List|Map/.test(n)?"Unbounded collection: look for static collections that only grow and add a size limit. ":/^\[B/.test(n)?"Large buffers retained: check caches and unclosed streams. ":"")+"Confirm with a heap dump (jcmd <pid> GC.heap_dump file.hprof) and inspect the path to GC roots in Eclipse MAT.";
+const spark=h=>{if(h.length<2)return"";const v=h.map(a=>a[1]),mn=Math.min(...v),mx=Math.max(...v);
+  return `<svg width="160" height="30"><polyline fill="none" stroke="#3da9fc" stroke-width="2" points="${h.map((a,i)=>(i/(h.length-1)*158+1).toFixed(1)+","+(28-(a[1]-mn)/(mx-mn||1)*26).toFixed(1)).join(" ")}"/></svg>`;};
+async function report(){
+  if(!last)return;const d=last,leaks=d.classes.filter(c=>c.leak).sort((a,b)=>b.severity-a.severity);let rows="";
+  for(const c of leaks){
+    let h=[];try{h=await (await fetch("/api/history?class="+encodeURIComponent(c.name))).json();}catch(e){}
+    const eta=c.slope>0?(d.heapMax-d.heapUsed)/(c.slope/d.interval):0;
+    rows+=`<tr><td><b>${esc(c.name)}</b><br>${spark(h)}</td><td class="${lvl(c.severity)}">${lvl(c.severity)} (${c.severity})</td><td>${(c.slope/1024).toFixed(0)} KB/sample</td><td>${c.instances}</td><td>${fmtEta(eta)}</td><td>${esc(fix(c.name))}</td></tr>`;
+  }
+  const html=`<!doctype html><meta charset="utf-8"><title>HeapVortex Leak Report</title><style>body{font:14px system-ui;max-width:1000px;margin:24px auto;padding:0 16px}table{border-collapse:collapse;width:100%}td,th{border:1px solid #ccc;padding:6px;vertical-align:top;text-align:left}th{background:#0b0f1a;color:#fff}.CRITICAL{color:#d00;font-weight:700}.HIGH{color:#e67e00;font-weight:700}.MEDIUM{color:#b8860b;font-weight:700}.LOW{color:#666}</style>
+<h1>HeapVortex Leak Report</h1><p>Generated ${new Date().toLocaleString()} · Heap ${MB(d.heapUsed)} / ${MB(d.heapMax)} · ${leaks.length} suspect(s)</p>
+<p><small>Severity (0-100) = 50% urgency (time until heap exhaustion at current growth) + 30% share of heap + 20% growth persistence.</small></p>
+${leaks.length?`<table><tr><th>Class / trend</th><th>Severity</th><th>Growth</th><th>Objects</th><th>Heap exhausted in</th><th>Suggested action</th></tr>${rows}</table>`:"<p>No leak suspects detected.</p>"}`;
+  const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([html],{type:"text/html"}));a.download="heapvortex-report.html";a.click();
+}
+async function loadHist(){const t=document.getElementById("selname");
+  if(!sel){t.textContent="Click a bar for its history";draw([]);return;}
+  t.textContent=sel;try{draw(await (await fetch("/api/history?class="+encodeURIComponent(sel))).json());}catch(e){}}
+addEventListener("wheel",e=>{cam.position.multiplyScalar(e.deltaY>0?1.05:.95)});
+const ray=new THREE.Raycaster(),mouse=new THREE.Vector2(),tip=document.getElementById("tip");
+addEventListener("mousemove",e=>{
+  if(drag){grp.rotation.y+=(e.clientX-px)*.008;grp.rotation.x=Math.max(-.6,Math.min(.6,grp.rotation.x+(e.clientY-py)*.004));px=e.clientX;py=e.clientY;}
+  mouse.set(e.clientX/innerWidth*2-1,-(e.clientY/innerHeight)*2+1);ray.setFromCamera(mouse,cam);
+  const hit=ray.intersectObjects(Object.values(meshes))[0];
+  if(hit){const c=hit.object.userData;tip.style.display="block";tip.style.left=e.clientX+12+"px";tip.style.top=e.clientY+12+"px";
+    tip.textContent=`${c.name} — ${MB(c.bytes)}, ${c.instances} objects`;}else tip.style.display="none";
+});
+addEventListener("resize",()=>{cam.aspect=innerWidth/innerHeight;cam.updateProjectionMatrix();rd.setSize(innerWidth,innerHeight)});
+(function loop(){requestAnimationFrame(loop);if(!drag)grp.rotation.y+=.002;rd.render(scene,cam);})();
+</script></body></html>
